@@ -665,6 +665,162 @@ class BitcoinScanner:
             self.logger.error(f'Error checking surrounding bytes: {e}')
             return False
 
+    def analyze_key_header(self, data, offset):
+        """
+        Analyze potential Bitcoin key headers with proper format validation
+        """
+        try:
+            # Look for WIF private key header (0x80)
+            # or compressed WIF header (0x80 + 0x01 compression flag)
+            header_markers = [
+                (b'\x80', 32),  # Uncompressed private key
+                (b'\x80\x01', 33),  # Compressed private key
+            ]
+
+            for header, key_length in header_markers:
+                pos = -1
+                while True:
+                    try:
+                        pos = data.index(header, pos + 1)
+                    except ValueError:
+                        break
+
+                    # Check if we have enough bytes for a full key
+                    if pos + key_length + 4 > len(data):  # +4 for checksum
+                        continue
+
+                    # Extract potential key data including header and checksum
+                    key_data = data[pos:pos + key_length + 4]
+
+                    # Validate WIF format
+                    if self.validate_wif_format(key_data):
+                        # Extract just the private key portion (removing header and checksum)
+                        private_key = key_data[1:33]  # Skip header byte(s)
+
+                        # Additional validation of the private key itself
+                        if self.validate_private_key(private_key):
+                            key_hash = hashlib.sha256(private_key).hexdigest()[:16]
+
+                            # Check for duplicates
+                            if key_hash in self.found_keys['private']:
+                                self.stats['duplicates'] += 1
+                                continue
+
+                            # Save the key
+                            self.found_keys['private'].add(key_hash)
+                            key_path = self.results_dir / 'keys' / f'wif_private_{key_hash}.bin'
+
+                            with open(key_path, 'wb') as f:
+                                f.write(key_data)  # Save full WIF format
+
+                            self.logger.info(f'Found valid WIF private key at offset {offset + pos}: {key_hash}')
+                            self.stats['pending_priv'] += 1
+
+            # Look for public key hash header (0x00 for P2PKH addresses)
+            pub_header = b'\x00\x14'  # P2PKH header
+            pos = -1
+            while True:
+                try:
+                    pos = data.index(pub_header, pos + 1)
+                except ValueError:
+                    break
+
+                # Check if we have enough bytes for a full public key hash
+                if pos + 24 > len(data):  # 20 bytes hash + 4 bytes checksum
+                    continue
+
+                # Extract potential public key hash data
+                pub_data = data[pos:pos + 24]
+
+                # Validate address format
+                if self.validate_address_format(pub_data):
+                    pub_hash = hashlib.sha256(pub_data[2:22]).hexdigest()[:16]  # Hash of just the pubkey hash
+
+                    # Check for duplicates
+                    if pub_hash in self.found_keys['public']:
+                        self.stats['duplicates'] += 1
+                        continue
+
+                    # Save the public key hash
+                    self.found_keys['public'].add(pub_hash)
+                    key_path = self.results_dir / 'keys' / f'pubkey_hash_{pub_hash}.bin'
+
+                    with open(key_path, 'wb') as f:
+                        f.write(pub_data)
+
+                    self.logger.info(f'Found valid public key hash at offset {offset + pos}: {pub_hash}')
+                    self.stats['pending_pub'] += 1
+
+        except Exception as e:
+            self.logger.error(f'Error analyzing key header at offset {offset}: {e}')
+
+    def validate_wif_format(self, data):
+        """
+        Validate Bitcoin WIF (Wallet Import Format) key format
+        """
+        try:
+            # Check minimum length (header + 32 bytes key + 4 bytes checksum)
+            if len(data) < 37:
+                return False
+
+            # Check header byte
+            if data[0] != 0x80:
+                return False
+
+            # Handle both compressed and uncompressed formats
+            if len(data) == 38:  # Compressed format
+                if data[33] != 0x01:  # Compression flag
+                    return False
+            elif len(data) != 37:  # Uncompressed format
+                return False
+
+            # Verify checksum
+            checksum = data[-4:]
+            payload = data[:-4]
+
+            # Double SHA256
+            hash1 = hashlib.sha256(payload).digest()
+            hash2 = hashlib.sha256(hash1).digest()
+
+            if hash2[:4] != checksum:
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f'Error validating WIF format: {e}')
+            return False
+
+    def validate_address_format(self, data):
+        """
+        Validate Bitcoin address format (P2PKH)
+        """
+        try:
+            # Check exact length (version + 20 bytes pubkey hash + 4 bytes checksum)
+            if len(data) != 24:
+                return False
+
+            # Check version byte
+            if data[0] != 0x00:
+                return False
+
+            # Verify checksum
+            checksum = data[-4:]
+            payload = data[:-4]
+
+            # Double SHA256
+            hash1 = hashlib.sha256(payload).digest()
+            hash2 = hashlib.sha256(hash1).digest()
+
+            if hash2[:4] != checksum:
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f'Error validating address format: {e}')
+            return False
+
     def analyze_potential_key(self, data, offset, marker_type):
         """
         Analyze potential key data with much stricter validation
@@ -881,9 +1037,13 @@ class BitcoinScanner:
             # Check for BitcoinJ format
             if BITCOIN_MARKERS['bitcoinj_header'] in block_data:
                 self.analyze_bitcoinj_format(block_data, offset)
-                
+
+            # Look for raw keys and proper key headers
+            if BITCOIN_MARKERS['key_header'] in block_data:
+                self.analyze_key_header(block_data, offset)
+
             # Look for raw keys
-            for key_marker in ['private_key', 'public_key', 'key_header']:
+            for key_marker in ['private_key', 'public_key']:
                 if BITCOIN_MARKERS[key_marker] in block_data:
                     self.analyze_potential_key(block_data, offset, key_marker)
                     
